@@ -1,0 +1,9 @@
+[Unit]
+Description=AI Berkshire Daily Quality Screen Timer (Mon-Fri 18:30 CST)
+
+[Timer]
+OnCalendar=Mon-Fri *-*-* 08:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

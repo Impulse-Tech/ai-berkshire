@@ -1,0 +1,10 @@
+[Unit]
+Description=AI Berkshire Daily Quality Screen
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/yang/Development/ai-berkshire/scripts/quality_screen.py
+Environment=HOME=/home/yang
+StandardOutput=journal
+StandardError=journal

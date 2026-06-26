@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+Daily Quality Screen Orchestrator for AI Berkshire.
+
+Reads today's Phase F output, extracts top 10 stocks, computes persistence
+across the last 5 runs, builds a hermes prompt, updates candidate-tracker.md,
+and calls hermes to run the quality screen.
+"""
+
+import argparse
+import json
+import logging
+import os
+import subprocess
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+# Paths
+PHASE_F_ROOT = Path("/home/yang/Dropbox/ai/shared/dev-stock-runtime/phase_f")
+RUNTIME_ROOT = Path("/home/yang/Dropbox/ai/shared/ai-berkshire-runtime")
+CANDIDATE_TRACKER = RUNTIME_ROOT / "pipeline" / "candidate-tracker.md"
+LOG_DIR = RUNTIME_ROOT / "logs"
+DISCORD_THREAD_ID = "1519978864720216195"
+
+
+def setup_logging(run_date: str, dry_run: bool) -> logging.Logger:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / f"quality_screen_{run_date}.log"
+    logger = logging.getLogger("quality_screen")
+    logger.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    if dry_run:
+        logger.info("DRY RUN mode — hermes will NOT be called, tracker will NOT be updated")
+    return logger
+
+
+def get_available_dates() -> list[str]:
+    """Return all Phase F run dates sorted ascending."""
+    dates = sorted(
+        d.name for d in PHASE_F_ROOT.iterdir()
+        if d.is_dir() and (d / "phase-f-output.json").exists()
+    )
+    return dates
+
+
+def load_phase_f(run_date: str) -> dict:
+    path = PHASE_F_ROOT / run_date / "phase-f-output.json"
+    with open(path) as f:
+        return json.load(f)
+
+
+def extract_top10(data: dict) -> list[dict]:
+    """Return top-10 signals (already sorted by score desc in JSON)."""
+    signals = data.get("signals", [])
+    return signals[:10]
+
+
+def strip_exchange(symbol: str) -> str:
+    """300502.SZ → 300502"""
+    return symbol.split(".")[0]
+
+
+def compute_persistence(top10_codes: list[str], all_dates: list[str], today_date: str) -> dict[str, int]:
+    """
+    For each code in today's top 10, count how many of the last 5 available
+    Phase F runs (excluding today) it appeared in the top 10.
+    Returns {code: count}.
+    """
+    # Dates before today, take last 5
+    prior_dates = [d for d in all_dates if d < today_date][-5:]
+
+    # Build set of codes per prior date
+    prior_top10s: list[set[str]] = []
+    for d in prior_dates:
+        try:
+            data = load_phase_f(d)
+            codes = {strip_exchange(s["symbol"]) for s in extract_top10(data)}
+            prior_top10s.append(codes)
+        except Exception:
+            pass  # skip corrupted/missing files
+
+    persistence = {}
+    for code in top10_codes:
+        count = sum(1 for prior_set in prior_top10s if code in prior_set)
+        persistence[code] = count
+
+    return persistence
+
+
+def build_hermes_prompt(top10: list[dict], persistence: dict[str, int], run_date: str, prior_count: int) -> str:
+    lines = [
+        f"Run quality-screen on these A-share stocks and post results to Discord Forum post thread {DISCORD_THREAD_ID}.",
+        "",
+        f"Stocks (from Phase F output dated {run_date}, ranked by score descending):",
+    ]
+    for i, sig in enumerate(top10, 1):
+        code = strip_exchange(sig["symbol"])
+        score = sig["score"]
+        count = persistence.get(code, 0)
+        persistent_flag = " ✅ persistent" if count >= 3 else ""
+        lines.append(f"{i}. {code} (score: {score:.2f}, appeared in {count}/{prior_count} recent runs{persistent_flag})")
+
+    lines += [
+        "",
+        "For each stock: run the full 7-criteria quality screen.",
+        "After screening: update candidate-tracker.md at "
+        f"{CANDIDATE_TRACKER} with today's results.",
+        f"Post a summary table to Discord Forum post thread {DISCORD_THREAD_ID} "
+        "(reply there, not as a new post).",
+    ]
+    return "\n".join(lines)
+
+
+def build_tracker_update(top10: list[dict], persistence: dict[str, int], run_date: str, prior_count: int) -> str:
+    today_obj = datetime.strptime(run_date, "%Y-%m-%d").date()
+    # ISO week Mon
+    week_start = today_obj - __import__("datetime").timedelta(days=today_obj.weekday())
+
+    rows = []
+    for sig in top10:
+        code = strip_exchange(sig["symbol"])
+        score = sig["score"]
+        count = persistence.get(code, 0)
+        persistent_flag = "✅" if count >= 3 else ""
+        rows.append(f"| {code} | {score:.2f} | {count}/{prior_count} {persistent_flag} | — | — | — |")
+
+    table = "\n".join(rows)
+    block = f"""
+## Week of {week_start} — Quality Screen Run {run_date}
+
+| Code | Score | Persistence ({prior_count} runs) | Quality Screen | Tier 3 Status | #stock-research post |
+|------|-------|----------------------------------|----------------|---------------|----------------------|
+{table}
+
+### Notes
+- Auto-generated by quality_screen.py at {datetime.now().strftime('%Y-%m-%d %H:%M')}.
+- Persistent = appeared in ≥3 of last {prior_count} Phase F runs.
+"""
+    return block.strip()
+
+
+def append_tracker(update_text: str) -> None:
+    with open(CANDIDATE_TRACKER, "a") as f:
+        f.write("\n\n---\n\n")
+        f.write(update_text)
+        f.write("\n")
+
+
+def call_hermes(prompt: str, logger: logging.Logger) -> None:
+    cmd = ["hermes", "chat", "-q", prompt]
+    logger.info("Calling: hermes chat -q <prompt>")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            logger.error("hermes exited %d: %s", result.returncode, result.stderr[:500])
+        else:
+            logger.info("hermes output: %s", result.stdout[:500])
+    except subprocess.TimeoutExpired:
+        logger.error("hermes timed out after 300s")
+    except FileNotFoundError:
+        logger.error("hermes not found in PATH — is ~/.local/bin in PATH?")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="AI Berkshire daily quality screen orchestrator")
+    parser.add_argument("--dry-run", action="store_true", help="Print prompt and tracker update; don't call hermes")
+    args = parser.parse_args()
+
+    today_str = date.today().isoformat()
+    logger = setup_logging(today_str, args.dry_run)
+
+    # 1. Find Phase F date to use
+    all_dates = get_available_dates()
+    if not all_dates:
+        logger.error("No Phase F output found under %s", PHASE_F_ROOT)
+        return 1
+
+    if today_str in all_dates:
+        run_date = today_str
+    else:
+        run_date = all_dates[-1]
+        logger.warning("No Phase F output for today (%s); using most recent: %s", today_str, run_date)
+
+    logger.info("Using Phase F run date: %s", run_date)
+
+    # 2. Load and extract top 10
+    data = load_phase_f(run_date)
+    top10 = extract_top10(data)
+    logger.info("Top 10 stocks: %s", [strip_exchange(s["symbol"]) for s in top10])
+
+    # 3. Compute persistence
+    top10_codes = [strip_exchange(s["symbol"]) for s in top10]
+    prior_dates_used = [d for d in all_dates if d < run_date][-5:]
+    prior_count = len(prior_dates_used)
+    persistence = compute_persistence(top10_codes, all_dates, run_date)
+    persistent = [c for c, n in persistence.items() if n >= 3]
+    logger.info("Persistence counts: %s", persistence)
+    logger.info("Persistent stocks (>=3/5): %s", persistent)
+
+    # 4. Build prompt
+    prompt = build_hermes_prompt(top10, persistence, run_date, prior_count)
+
+    # 5. Build tracker update
+    tracker_update = build_tracker_update(top10, persistence, run_date, prior_count)
+
+    if args.dry_run:
+        print("\n" + "=" * 60)
+        print("HERMES PROMPT:")
+        print("=" * 60)
+        print(prompt)
+        print("\n" + "=" * 60)
+        print("CANDIDATE TRACKER UPDATE (would be appended):")
+        print("=" * 60)
+        print(tracker_update)
+        print("=" * 60 + "\n")
+        return 0
+
+    # 6. Call hermes
+    call_hermes(prompt, logger)
+
+    # 7. Update candidate tracker
+    append_tracker(tracker_update)
+    logger.info("Candidate tracker updated: %s", CANDIDATE_TRACKER)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
